@@ -11,4 +11,12 @@ class BaseModel(models.Model):
 
 
 class ExchangeAdmin(admin.ModelAdmin):
+
+    actions = ["get_and_update_markets"]
     readonly_fields = ["markets"]
+
+    def get_and_update_markets(self, request, queryset):
+        if len(queryset) == 1:
+            queryset[0].get_and_update_markets()
+        else:
+            raise Exception()
