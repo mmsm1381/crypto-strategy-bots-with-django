@@ -1,5 +1,5 @@
 import traceback
-from abc import ABC
+from abc import ABC, abstractmethod
 from enum import Enum
 
 from django.db import models
@@ -19,13 +19,20 @@ class BaseExchangeInterFace(ABC):
         self.api_secret = api_secret
         super().__init__()
 
+    @abstractmethod
     def get_client(self):
         raise NotImplementedError
 
+    @abstractmethod
     def get_and_update_markets(self, db_instance):
         raise NotImplementedError
 
-    def submit_order(self, order_dict):
+    @abstractmethod
+    def submit_order(self, order_dict: dict) -> int:
+        raise NotImplementedError
+
+    @abstractmethod
+    def update_order_state(self, order_id: int):
         raise NotImplementedError
 
 
@@ -34,7 +41,7 @@ class Tabdeal(BaseExchangeInterFace):
     def get_client(self):
         return Spot(self.api_key, self.api_secret)
 
-    def get_and_update_markets(self, db_instance):
+    def get_and_update_markets(self, exchange_db_instance):
         client = self.get_client()
         markets = client.exchange_info()
         markets_id = []
@@ -44,20 +51,46 @@ class Tabdeal(BaseExchangeInterFace):
             markets_id.append(
                 Market.objects.get_or_create(first_currency=first_currency,
                                              second_currency=second_currency)[0].id)
-        db_instance.markets.add(*markets_id)
+        exchange_db_instance.markets.add(*markets_id)
 
-    def submit_order(self, order_dict):
+    def submit_order(self, order_dict: dict) -> int:
         client = self.get_client()
         order_side = OrderSides.SELL if order_dict.get(
             "side") == Order.Side.Sell.value else OrderSides.BUY
         market = Market.objects.get(id=order_dict.get("market"))
-        client.new_order(
+        order = client.new_order(
             symbol=f"{market.first_currency}{market.second_currency}",
             side=order_side,
             type=OrderTypes.LIMIT,
             quantity=order_dict.get("amount"),
             price=order_dict.get("price")
         )
+        return int(order['orderId'])
+
+    def update_order_state(self, order_id: int) -> None:
+        client = self.get_client()
+        db_order = Order.objects.get(id=order_id)
+        remote_order = client.get_order(
+            symbol=f"{db_order.market.first_currency.symbol}_{db_order.market.second_currency.symbol}",
+            order_id=db_order.remote_id
+        )
+        order_state = remote_order['status']
+        if order_state == "NEW":
+            db_order.state = Order.State.Waiting.value
+        elif order_state == "FILED":
+            db_order.state = Order.State.Filled.value
+        elif order_state == "PARTIALLY_FILLED":
+            db_order.state = Order.State.PartiallyFilled.value
+        elif order_state == "PARTIALLY_FILLED_AND_FINISHED":
+            db_order.state = Order.State.PartiallyFilledAndFinished.value
+        elif order_state == "ERROR":
+            db_order.state = Order.State.Error.value
+        elif order_state == "CANCELED":
+            db_order.state = Order.State.Canceled.value
+        else:
+            db_order.state = Order.State.Idle.value
+
+        db_order.save(update_fields=["state", "updated"])
 
 
 class ExchangeProviders(Enum):
@@ -113,10 +146,17 @@ class Exchange(utils_bases.BaseModel):
                                                                         api_secret=api_secret)
 
     def get_and_update_markets(self):
-        self.exchange_interface().get_and_update_markets(db_instance=self)
+        self.exchange_interface().get_and_update_markets(exchange_db_instance=self)
 
-    def submit_order(self, order_dict, account):
-        self.exchange_interface(api_key=account.api_key, api_secret=account.api_secret).submit_order(order_dict)
+    def submit_order(self, order_dict: dict, account) -> int:
+        order_id = self.exchange_interface(api_key=account.api_key, api_secret=account.api_secret).submit_order(
+            order_dict)
+        return order_id
+
+    def update_order_state(self, order_id: int, account) -> None:
+        self.exchange_interface(api_key=account.api_key, api_secret=account.api_secret).update_order_state(
+            order_id=order_id
+        )
 
     def __str__(self):
         return ExchangeProviders(self.exchange_provider).name
@@ -144,30 +184,40 @@ class Order(utils_bases.BaseModel):
         Filled = 5
         Canceled = 6
         Error = 7
+        Idle = 8
 
-        def active_states(self):
-            return [self.WaitingToSubmit.value, self.Waiting.value, self.PartiallyFilled.value]
+        @staticmethod
+        def active_states():
+            return [Order.State.Waiting.value, Order.State.PartiallyFilled.value]
 
     exchange = models.ForeignKey('trading_bot.Exchange', on_delete=models.PROTECT)
-    grid_bot = models.ForeignKey('trading_bot.GridBot', on_delete=models.PROTECT)
+    grid_bot = models.ForeignKey('trading_bot.GridBot', on_delete=models.PROTECT, related_name="bot_orders")
     account = models.ForeignKey('trading_bot.Account', on_delete=models.PROTECT)
     market = models.ForeignKey('trading_bot.Market', on_delete=models.PROTECT)
     price = models.DecimalField(max_digits=32, decimal_places=8)
     amount = models.DecimalField(max_digits=32, decimal_places=8)
     side = models.SmallIntegerField(choices=Side.choices)
+    remote_id = models.PositiveBigIntegerField(null=True, blank=True)
     state = models.SmallIntegerField(choices=State.choices, default=State.WaitingToSubmit.value)
     comments = models.TextField(null=True, blank=True)
+
+    class Meta:
+        unique_together = ['remote_id', 'exchange']
 
     def submit_order(self):
         try:
             order_dict = OrderSerializer(instance=self).data
-            self.exchange.submit_order(order_dict=order_dict, account=self.account)
+            order_remote_id = self.exchange.submit_order(order_dict=order_dict, account=self.account)
             self.state = Order.State.Waiting.value
-            self.save(update_fields=["state", 'updated'])
+            self.remote_id = order_remote_id
+            self.save(update_fields=["state", "remote_id", "updated"])
         except Exception as ve:
             self.state = Order.State.Error.value
             self.comments = ve.__str__() + "\n" + str(traceback.format_exc()) + "\n"
             self.save(update_fields=["state", 'comments', 'updated'])
+
+    def update_order_state(self):
+        self.exchange.update_order_state(order_id=self.id, account=self.account)
 
 
 class OrderSerializer(serializers.ModelSerializer):
@@ -217,6 +267,16 @@ class GridBot(Bot):
                 market=self.market
             ))
         Order.objects.bulk_create(objs=orders_list)
+
+    def check_and_update_order_state_and_create_new_order_if_needed(self):
+        bot_orders = self.bot_orders.exclude(state__in=Order.State.active_states())
+        for order in bot_orders:
+            order.update_order_state()
+            order.refresh_from_db()
+            if order.state in [Order.State.Filled.value, Order.State.PartiallyFilled.value] and order.trade is None:
+                pass
+
+
 
     def deactivate(self):
         raise NotImplementedError

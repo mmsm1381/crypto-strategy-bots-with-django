@@ -1,7 +1,6 @@
 from django.contrib import admin
 
 from trading_bot import models as trading_bot_models
-from utils import bases as utils_bases
 
 
 class ExchangeAdmin(admin.ModelAdmin):
@@ -27,11 +26,15 @@ class GridBotAdmin(admin.ModelAdmin):
 
 class OrderAdmin(admin.ModelAdmin):
     list_display = [field.name for field in trading_bot_models.Order._meta.fields]
-    actions = ["submit_order"]
+    actions = ["submit_order", "update_order_state"]
 
     def submit_order(self, request, queryset):
         for order in queryset:
             order.submit_order()
+
+    def update_order_state(self, request, queryset):
+        for order in queryset:
+            order.update_order_state()
 
 
 class AccountAdmin(admin.ModelAdmin):
